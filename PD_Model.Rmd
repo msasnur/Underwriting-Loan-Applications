@@ -1,0 +1,343 @@
+---
+title: "Predicting Probability of Defaulters"
+author: "Group 3"
+output: 
+  html_document:
+    theme: lumen
+    highlight: haddock
+    toc: true
+    toc_float: true
+    number_sections: false
+    toc_depth: 3
+---
+
+
+## Objective
+
+This model was been built to determine probability of customers to be defaulters/non-defaulters
+
+
+## Libraries
+
+Loading required libraries into work-space
+```{r,message=FALSE}
+
+library(dplyr)
+library(caret)
+library(readr)
+library(broom)
+library(pROC)
+library(randomForest)
+library(gmodels)
+library(ROCR)
+
+```
+
+
+## Data Cleaning 
+
+Importing training data, converting loss column to factor containing 1 and 0; 1 means defaulters , 0 means non-defaulter. Finally, eliminating extra ID columns.
+
+```{r, warning=FALSE,message=FALSE}
+
+raw_data <- read_csv("train_v3(1).csv")
+
+raw_data$X1 <- NULL
+
+raw_data$type <- as.factor(ifelse(raw_data$loss ==0,0,1))
+
+raw_data$loss <- NULL
+```
+
+
+First, we eliminate all *duplicate* columns
+```{r, warning=FALSE}
+
+data_uni <-raw_data[!duplicated(as.list(raw_data))]
+
+```
+
+
+Before *standardizing* the data we check *zero variance* across all column.
+```{r, warning=FALSE}
+
+dummy <- nearZeroVar(data_uni)
+
+data_nzv <- data_uni[,-dummy] 
+
+anyNA(data_nzv)
+```
+
+
+Before we go further we need to check for missing values in our data. This can be done using imputation techniques; here we are replacing  missing values with  **median imputation technique**
+```{r, warning=FALSE}
+data_nzv <- data.frame(data_nzv)
+
+impute<- preProcess(data_nzv,method = "medianImpute")
+
+data_imt <- predict(impute,data_nzv)
+
+anyNA(data_imt)
+
+```
+
+
+## Preprocessing
+
+We must now partition data into train and test splits.
+```{r, warning=FALSE}
+set.seed(123)
+
+data.index <- createDataPartition( data_imt$f3, p=0.75, list = FALSE)
+
+train_l <- data_imt[ data.index, ]
+
+test_l <- data_imt[ -data.index, ]
+
+```
+
+## Model Construction
+
+### Logistic Regression
+
+The goal here is to predict if a customer is defaulter/non-defaulter. Since this is a binary class classification, *logistic regression* is the best-suited techinque.
+
+```{r, warning=FALSE}
+
+logit_model <- glm(type ~., data = train_l, family = binomial)
+
+```
+
+
+**Cross Validation:**
+
+```{r, warning=FALSE}
+levels(train_l$type)
+
+# predicting probablity for traget varilable of class "1" who are defaulters
+
+logit_pred_test <- predict(logit_model, test_l, type="response")
+
+# converting probabilities into class of either "0" or "1"
+
+prediction_test <- as.factor(ifelse(logit_pred_test > 0.5,1,0))
+
+# checking performance metric for test data
+
+(perf_metric<- confusionMatrix(prediction_test,test_l$type))
+
+```
+From the performance matrix we see **accuracy** of **`r perf_metric$overall[[1]]`** for test data. If we see **No Information Rate** is at **0.9106** this implies largest proportion of the observed classes here are non-defaulters. A hypothesis test is also computed to evaluate whether the overall accuracy rate is greater than the rate of the largest class.
+
+
+```{r,echo=FALSE}
+table(data_imt$type)
+```
+Above table depicts classes of data :  non-default (0) and default (1).
+
+```{r,echo=FALSE}
+table(test_l$type,prediction_test)
+```
+                              
+We found predictions from the model are biased towards non-default class as they are more prevalent across the dataset. This can also be seen in the difference between **Sensitivity** as **`r perf_metric$byClass[[1]]`** and **Specficity** as **`r perf_metric$byClass[[2]]`**. Hence, there is need to evenly *balance* the data.
+
+
+### Balancing data
+
+```{r, warning=FALSE}
+
+set.seed(123)
+
+# As defaulters class is less, we will be sampling same no of non-defaulters 
+index <- sample(length(data_imt$type[data_imt$type==0]),length(data_imt$type[data_imt$type==1]))
+
+# filter non-defaulters data  
+data_imt_0 <- data_imt %>% filter( type == 0)
+
+# filter defaulters data
+data_imt_1 <- data_imt %>%  filter(type == 1)
+
+# Creating balanced dataset
+data_imt_0 <- data_imt_0[index,]
+
+data_imt <-  as.data.frame( rbind( data_imt_0, data_imt_1))
+
+table(data_imt$type)
+```
+
+
+### Constructing logistic regression for balanced data
+```{r, warning=FALSE}
+set.seed(123)
+
+data.index <- createDataPartition(data_imt$f3,p=0.75,list = FALSE)
+
+train <- data_imt[data.index,]
+
+test <- data_imt[-data.index,]
+
+```
+
+```{r,warning=FALSE}
+# Logistic Regression Model
+
+logit_model_balanced <- glm(type~., data=train[,-1],family = "binomial")
+
+# Predicting the probabilities of defaulters.
+
+logit_pred_test_balanced <- predict(logit_model_balanced,test[,-1],type="response")
+
+# converting probabilities into class of either "0" or "1"
+
+pred1 <- as.factor(ifelse(logit_pred_test_balanced > 0.5,1,0))
+```
+
+**Cross Validation** of predicted data vs actual data
+```{r}
+CrossTable(x=test$type, y=pred1, prop.chisq = FALSE) 
+```
+
+**Performance Metrics** of test data 
+```{r}
+confusionMatrix(test$type, pred1)
+```
+
+**ROC**
+```{r,warning=FALSE,message=FALSE}
+ROC <- roc(test$type,logit_pred_test_balanced)
+
+```
+
+AUC value of the model is **`r auc(ROC)`**
+
+
+### Regularized Regression Model
+
+Logistic regression using lasso (L1) regularization. We have 658 variables in training set, Lasso regresssion has the capability to zero out the coefficients of non-significant variables and consider only significant variables to train the model with.
+
+```{r, warning=FALSE,message=FALSE}
+set.seed(123)
+
+myControl <- trainControl(method = "cv",
+                          number = 5,
+                          summaryFunction = twoClassSummary,
+                          classProbs = TRUE
+                          ,verboseIter = TRUE)
+
+model_ct <- train(make.names(type)~.,data=train,method="glmnet",trControl=myControl)
+```
+
+### Prediction on Test data
+```{r,warning=FALSE}
+pred_cv <- predict(model_ct,test)
+
+# Cross Validation on Test data
+
+CrossTable(x=test$type,y=pred_cv, prop.chisq = FALSE)
+
+# Perforamnce metrics of Test data
+
+test1 <- test$type
+
+levels(test1) <- c("X0","X1")
+
+confusionMatrix(test1,pred_cv)
+```
+
+
+**ROC **
+```{r,warning=FALSE,message=FALSE}
+
+pred_roc <- predict(model_ct,test,type = "prob")
+
+ROC_cv <- roc(test$type,pred_roc[,2])
+
+```
+
+AUC for lasso model is **`r auc(ROC_cv)`**
+
+
+## Ensemble Method
+
+### Random Forest Model
+
+Constructing the Random Forest model to predict the target variable 
+```{r, warning=FALSE}
+
+set.seed(123)
+
+rf.model <- randomForest(type~.,
+                         data=train[,-1],
+                         ntree = 700,
+                         mtry=c(25,50,100),
+                         importance=TRUE)
+
+# Predicitng the target varialbe
+
+pred_rf <- predict(rf.model,test)
+```
+
+**Cross Validation** 
+```{r,warning=FALSE}
+
+CrossTable(x=test$type,y=pred_rf, prop.chisq = FALSE) 
+
+```
+
+**Performance Metrics**
+```{r,warning=FALSE}
+
+confusionMatrix(test$type,pred_rf)
+
+```
+
+**ROC Curves**
+```{r,warning=FALSE,message=FALSE}
+
+pred_rf_roc <- predict(rf.model,test,type="prob")
+
+ROC_rf <- roc(test$type,pred_rf_roc[,2])
+
+
+```
+AUC value for random forest model is **`r auc(ROC_rf)`** 
+
+
+The below plot depicts the most relevant variables chosen by the Random Forest algorithm 
+```{r,fig.align="center",fig.height=15}
+varImpPlot(rf.model)
+```
+
+When the number of variables is large, but the fraction of **relevant variables is small**, random forests are likely to perform poorly when **m** (no. of revelant variables) is small.
+Why?
+Because, at each split the chance is small that the relevant variables will be selected. For example, with 3 relevant and 100 minimally relevant variables, the probability of any of the relevant variables being selected at any split is ~ 0.25
+
+
+## Conclusion 
+```{r echo=FALSE,fig.align="center"}
+
+final_list <- list(logit = logit_pred_test_balanced,lasso = pred_roc[,2], RF=pred_rf_roc[,2])
+
+m <- length(final_list)
+
+actuals_list <- rep(list(test$type), m)
+
+pred <- prediction(final_list, actuals_list)
+
+rocs <- performance(pred, "tpr", "fpr")
+
+plot(rocs, col = as.list(1:m), main = "Test Set ROC Curves")
+legend(x = "bottomright", 
+       legend = c("Logistic Regression", "Lasso Regression", "Random Forest"),
+        fill = 1:m,cex=0.6,box.lty=0)
+
+```
+
+Based on above plot we see lasso model is performing better than logistic or random forest model. Thus, we will be using lasso model to predict target variable for test scenario. 
+
+
+Saving Lasso regression model for future use.
+```{r}
+lasso_pd <- model_ct
+saveRDS(lasso_pd, "./lasso_pd.rds")
+```

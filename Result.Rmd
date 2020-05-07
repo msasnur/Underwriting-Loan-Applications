@@ -1,0 +1,185 @@
+---
+title: "Underwriting Loan Applications"
+author: "Group 3"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: haddock
+---
+
+## Objective
+
+Our main objective in this project is to build a Machine Learning Model to determine whether we should lend money to a customer, given various budget and/or risk constraints. Most of the profits made by banks are by investing money in people or companies, and gaining profit from interest paid. It is crucial to know the investment risk of each customer before we provide him/her with a loan. 
+
+
+We need to answer few questions before approving a loan
+
+
+a.	Can the customer repay the loan amount within stipulated time?
+
+
+b.	Is the customer going to miss any installments?
+
+
+c.	After analyzing these risks, do we approve him/her for a loan?  
+
+
+As the underwriting team for our bank, it is our goal to detail whether the customer will default or not. This project will help the bank to better understand its customer base from a risk perspective.
+
+## Libraries
+
+#### Loading required libraries
+```{r,message=FALSE}
+library(readr)
+library(caret)
+library(broom)
+library(tidyverse)
+```
+
+
+#### Loading Test scenario Data of 1 & 2
+```{r,message=FALSE,warning=FALSE}
+data_test <- read_csv("test_scenario1_2(1).csv")
+test_scenario <- data_test
+```
+
+
+## Models
+
+#### Recalling saved models of **Probability of Default(PD)** and **Loan Given Default(LGD)**
+```{r}
+PD <- readRDS("./lasso_pd.rds")
+LGD <- readRDS("./lasso_lgd.rds")
+```
+
+
+## Preprocessing of Data
+
+Imputing missing values with median imputation techniques
+```{r}
+impute_1 <- preProcess(test_scenario, method = "medianImpute")
+test_scenario <-  data.frame(test_scenario)
+test_impt <- predict(impute_1,test_scenario)
+anyNA(test_impt)
+```
+
+#### Scaling data
+```{r}
+test_scenario_data <- test_impt[,-c(1,ncol(test_impt))]
+test_impt_norm <- scale(test_scenario_data)
+```
+
+#### Subsetting the data based on the columns required by the models
+```{r}
+test_scenario_PD <- test_impt_norm[,PD$coefnames]
+test_scenario_LGD <- test_impt_norm[,LGD$beta@Dimnames[[1]]]
+```
+
+#### Predicting the output
+```{r}
+# PD Model
+test_scenario__model_PD <- predict( PD, test_scenario_PD)
+test_scenario__model_PD <- as.data.frame(ifelse(test_scenario__model_PD == "X0",0,1))%>% pull 
+
+# LGD Model
+test_scenario__model_LGD <- predict(LGD,test_scenario_LGD)
+test_scenario__model_LGD <- as.vector(ifelse(test_scenario__model_LGD<0,0,round(test_scenario__model_LGD,2)))
+
+data_test$LGD <- test_scenario__model_LGD
+data_test$PD <- as.numeric(test_scenario__model_PD)
+```
+
+
+## Scenarios
+
+Here, we are defining new parameters called Risk, Gain, and Delta. 
+
+
+Risk is given by,
+**Risk = Loan value * LGD * PD**
+
+
+Gain is given by,
+**Gain = Loan value * interest_rate(%) * (1-PD) * number of years**
+
+
+Delta is given by,
+**Delta = Gain - Risk**
+
+Loan value is defined as requested loan amount by each customer for 5 years
+
+
+LGD is Loan Given Default in percentage predicted by the model on test scenario
+
+
+PD is Probability of Default s 1(defaulter) & 0(non-defaulter) predicted by the model on test scenario
+
+
+Subsetting the required columns
+```{r}
+data_sec <- data_test %>% 
+  mutate(Risk = requested_loan*PD*(LGD/100),Gain = requested_loan*4.32/100*(1-PD)*5, Delta = Gain-Risk ) %>%   
+  select(X1,X,id,requested_loan,LGD,PD,Risk,Gain,Delta)
+```
+
+### Scenario 1
+
+Given, the total capital of 1.4 billion, we should consider the Risk = 0 which implies application is approved else rejected.
+```{r}
+# Status "1" is approved and "0" is rejected 
+G3_S1 <- data_sec %>% mutate(Status = ifelse(Delta>0,1,0))
+```
+```{r,include=FALSE}
+write.csv(G3_S1,"G3_S1.csv")
+```
+```{r,echo=FALSE}
+ggplot(G3_S1 %>% select(Status) %>% group_by(Status) %>% summarise(Count=n()),aes(x=factor(Status,levels=c(0,1),labels = c("Rejected","Approved")),y=Count))+geom_bar(stat = "identity",width=0.5,fill="blue4")+geom_text(aes(x=factor(Status,levels=c(0,1),labels = c("Rejected","Approved")),y=Count,label=Count),vjust=-0.4) + theme_classic() + theme(axis.line.y = element_blank(),axis.text.y = element_blank(),axis.title.y = element_blank(),axis.ticks.y = element_blank()) + labs(x="Status") + ggtitle("Number of Approved and Rejected")
+```
+
+### Scenario 2
+
+Given the total capital of 450 million is allocated amoung customers based on ranking Delta > 0 which implies application is approved else rejected.
+```{r}
+# Status "1" is approved and "0" is rejected
+G3_S2 <- data_sec %>% 
+  arrange(desc(Delta)) %>% 
+  mutate( total_sum = cumsum(requested_loan)) %>% 
+  mutate (Status = ifelse(total_sum <= 450000000,1,0)) 
+G3_S2$total_sum<- NULL
+```
+```{r,include=FALSE}
+write.csv(G3_S2,"G3_S2.csv")
+```
+```{r,echo=FALSE}
+ggplot(G3_S2 %>% select(Status) %>% group_by(Status) %>% summarise(Count=n()),aes(x=factor(Status,levels=c(0,1),labels = c("Rejected","Approved")),y=Count))+geom_bar(stat = "identity",width=0.5,fill="blue4")+geom_text(aes(x=factor(Status,levels=c(0,1),labels = c("Rejected","Approved")),y=Count,label=Count),vjust=-0.4) + theme_classic() + theme(axis.line.y = element_blank(),axis.text.y = element_blank(),axis.title.y = element_blank(),axis.ticks.y = element_blank()) + labs(x="Status") + ggtitle("Number of Approved and Rejected")
+```
+
+
+### Scenario 3
+
+Given the total capital of 1.4 billion, we should consider the Delta > 0 which implies application is approved else rejected.
+```{r,warning=FALSE,message=FALSE}
+data_test_3 <- read_csv("test_scenario3(1).csv")
+```
+```{r}
+identical(data_test[,-c(764:766)],data_test_3[,-c(764,765)])
+
+data_test_3$LGD <- data_test$LGD
+data_test_3$PD <- data_test$PD
+
+
+data_sec_3 <- data_test_3 %>% 
+  mutate(Risk = requested_loan*PD*(LGD/100),Gain = requested_loan*(Proposed_Intrest_Rate/100)*(1-PD)*5, Delta = Gain-Risk ) %>%   
+  select(X1,X,id,requested_loan,Proposed_Intrest_Rate,LGD,PD,Risk,Gain,Delta)
+
+G3_S3 <- data_sec_3 %>% mutate(Status = ifelse(Delta>0,1,0))
+```
+```{r,include=FALSE}
+write.csv(G3_S3,"G3_S3.csv")
+```
+```{r,echo=FALSE}
+ggplot(G3_S3 %>% select(Status) %>% group_by(Status) %>% summarise(Count=n()),aes(x=factor(Status,levels=c(0,1),labels = c("Rejected","Approved")),y=Count))+geom_bar(stat = "identity",width=0.5,fill="blue4")+geom_text(aes(x=factor(Status,levels=c(0,1),labels = c("Rejected","Approved")),y=Count,label=Count),vjust=-0.4) + theme_classic() + theme(axis.line.y = element_blank(),axis.text.y = element_blank(),axis.title.y = element_blank(),axis.ticks.y = element_blank()) + labs(x="Status") + ggtitle("Number of Approved and Rejected")
+```
+
+
+

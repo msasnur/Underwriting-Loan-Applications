@@ -1,0 +1,327 @@
+---
+title: "Prediction of Loan Defaulters"
+author: "Group 3"
+output: 
+  html_document:
+    theme: lumen
+    highlight: haddock
+    toc: true
+    toc_float: true
+    number_sections: false
+    toc_depth: 3
+---
+
+
+## Objective
+
+Our objective is to build a predictive model to find **Loss Given Default(LGD) ** on whether banks should lend money to a customer. LGD is defined as the percentage of loan amount that was not able to be paid back to the bank. For example, if a customer is approved for a loan of $20,000 for five years, they will return $20,000 (the capital) plus 5*4.32%*20,000=4320 after five years if he/she does not default. If he/she defaults at 80%, it means that he/she would pay back only 20% of the capital 20,000*20%=$4,000 and zero interest (i.e. the loss is $16,000 for the bank).   
+
+
+We are given training dataset which contains a list of variables and the target variable i.e, **loss**. Loss defines the percentage of the loan at which the customer defaults. If loss is zero, we can imagine that the customer has fully paid back the capital and interest. If the “loss” is greater than zero, it means that the customer has defaulted. “loss” is expressed in percentage so if loss is 10, then it means that the customer has paid pack 90% of the capital but zero interests. 
+
+
+## Libraries
+
+Loading required libraries into work-space
+```{r message=FALSE}
+
+library(caret)
+library(readr)
+library(glmnet)
+library(broom)
+library(xgboost)
+library(glmnetUtils)
+library(tidyverse)
+
+```
+
+
+## Data Cleaning 
+
+Importing training data and eliminating extra ID columns
+```{r, warning=FALSE,message=FALSE}
+raw_data <- read_csv( "train_v3(1).csv" )
+raw_data$X1 <- NULL
+```
+
+
+First we eliminate all *duplicate* columns
+```{r, warning=FALSE}
+data_uni <- raw_data[!duplicated( as.list( raw_data))]
+```
+
+
+Before *standardizing* the data we first check *zero variance* across all columns.
+```{r, warning=FALSE}
+dummy <- nearZeroVar( data_uni)
+
+data_nzv <- data_uni[ , -dummy ] %>%
+  mutate( loss = data_uni$loss)
+```
+
+
+To build this model, we have considered *only defaulters* data from **loss** column.
+```{r, warning=FALSE}
+data_act <- data_nzv[ data_nzv$loss > 0, ]
+```
+
+
+Before we go further we need to check for missing values in our data. This can be done using imputation techniques; here we are replacing  missing values with  **median imputation technique**
+```{r, warning=FALSE}
+anyNA(data_act)
+
+impute <- preProcess( data_act , method = "medianImpute")
+
+data_imt <- predict( impute,data_act )
+
+anyNA( data_imt )
+```
+
+
+## Preprocessing
+
+We found out that the features of data are on different scales, we need to standardize the data.
+To train our model, we must partition training data into train and test splits.
+```{r, warning=FALSE}
+set.seed(123)
+
+data.index <- createDataPartition( data_imt$f3, p=0.75, list = FALSE)
+
+train <- data_imt[ data.index, ]
+
+test <- data_imt[ -data.index, ]
+
+# We are sclaing data excluding ID and target variable
+train.norm <- train[ , -c(1, ncol(train))]
+
+test.norm <- test[ , -c( 1, ncol(test))]
+
+model.norm <- preProcess( train.norm, method = c("center","scale"))
+
+train.norm <- predict( model.norm, train.norm)
+
+test.norm <- predict( model.norm, test.norm)
+```
+
+## Model Construction
+### Linear Regression
+
+
+Using train data, we are building a *simple linear regression* model.
+```{r, warning=FALSE}
+lr_model1 <- lm(loss ~., data = train[ ,-1])
+
+glance( lr_model1 )
+```
+
+
+**Performance metrics:**
+```{r, warning=FALSE}
+# RMSE on test data
+(linear_base_rsme <- sqrt( mean(( test$loss - predict( lr_model1, test))^2)))
+
+# R squared on test data
+(linear_base_rsquare <- cor( test$loss, predict( lr_model1, test))^2)
+```
+From the above observation, we see *RSME* for train and test datasets as **`r sqrt( mean(( train$loss - predict( lr_model1, train))^2)) `** and **`r linear_base_rsme`**. Also, the *percentage of variability* explained by independent variables for training data is **`r glance(lr_model1)[[1]]`** and test data,as **`r linear_base_rsquare`** . Hence we conclude that model is over-fitting on training data and not performing well on test set.
+
+
+Considering the statistically significant variables from the base model we'll construct a regression model again.
+```{r, warning=FALSE}
+# Extracting significant variables from the model
+
+data_tidy <- tidy( lr_model1 ) %>%
+  filter( p.value < 0.05) %>% 
+  select(term) %>% 
+  filter( term != "(Intercept)") %>% 
+  pull
+
+train_t <- train[ , data_tidy] %>% mutate( loss = train$loss)
+
+lr_model2 <- lm(loss ~., train_t)
+
+glance(lr_model2)
+
+# RMSE on test data
+
+(linear_sig_rsme <- sqrt(mean(( test$loss- predict( lr_model2,test ))^2)))
+
+# R Squared on test data
+
+(linear_sig_rsquare<- cor( test$loss, predict(lr_model2,test))^2)
+
+```
+In the above model, we see *RSME* for train and test datasets as **`r sqrt( mean(( train_t$loss - predict(lr_model2))^2)) `** and **`r linear_sig_rsme`**. We also check for the percentage of variability as **`r glance(lr_model1)[[1]]`** for training data and  test data, we obtained **`r linear_sig_rsquare`**. It is clear that the test data is able to explain the  *similar variability*.
+
+
+### Regularized Regression Models
+
+
+In the above models, there are *no penalty metrics* added to the model. This can be achieved by using Lasso (L1) or Ridge (L2) regularization. For this model we will be using L1 regularization since it zeros out the coefficient of the variable.
+```{r, warning=FALSE}
+# We will perform cross validation to find the best hyper parameters i.e. lambda
+
+lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+
+lasso_cv <- cv.glmnet( x = as.matrix( train.norm ),
+                       y = train$loss,
+                       alpha = 1,
+                       lambda = lambdas_to_try,
+                       nfolds = 10)
+
+(lambda_cv <- lasso_cv$lambda.min)
+
+```
+
+**lambda.min** is the value of λ that gives minimum mean cross-validated error. The other λ saved is **lambda.1se**, which gives the most regularized model such that error is within one standard error of the minimum
+
+```{r echo=FALSE, message=FALSE, fig.align= "center" }
+plot(lasso_cv$lambda)
+```
+
+We obtain minimum error for corresponding lambda value **`r lambda_cv`** from above cross validation. We further build a model explicitly using lasso regression model. 
+
+
+```{r, warning=FALSE}
+model_cv <- glmnet( x= as.matrix(train.norm),
+                    y= as.matrix(train$loss),
+                    alpha= 1,
+                    lambda= lambda_cv )
+# Predicting on train data  
+pl_1 <- predict( model_cv, as.matrix( train.norm ))
+
+# RMSE on train data  
+(lasso_train_rsme <- sqrt( mean(( train$loss-pl_1 )^2)))
+# R squared on train dta
+(lasso_train_raquare <- cor(train$loss, pl_1)^2)
+
+# Predicting on test data  
+pl_2 <- predict( model_cv, as.matrix( test.norm ))
+
+# RMSE on test data
+(lasso_test_rsme <- sqrt( mean(( test$loss-pl_2)^2)))
+# R sqaured on test data
+(lasso_test_rsquare <- cor(test$loss, pl_2)^2)
+```
+
+
+From the lasso model we see RSME for *train and test data* are **`r lasso_train_rsme` and `r lasso_test_rsme`** respectively. The percentage of variability as **`r lasso_train_raquare[1]`** for training data and  test data, we obtained **`r lasso_test_rsquare[1]`**.
+
+
+
+We can try and improve the performance of model further still by using ensemble method. We have sought to use *XGBoost method* to check our model performance.
+
+## Ensemble Method
+
+### XGboost Model
+
+Constructing the cross validation model of XGboost to find the hyper-tuning parameters.
+```{r, warning=FALSE}
+
+set.seed(123)
+
+xgbcv = xgb.cv(data=as.matrix(train.norm),
+               label= train$loss,
+               nrounds=300,
+               nfold=5,
+               objective = "reg:linear",
+               eta = 0.3,
+               max_depth = 7,
+               verbose = 0)
+
+logs <- xgbcv$evaluation_log
+
+(logs_min <- logs %>% 
+    summarize(ntrees.train=which.min(train_rmse_mean),ntrees.test=which.min(test_rmse_mean))) %>%
+  knitr::kable()
+
+```
+
+
+
+```{r echo=FALSE,fig.align= "center"}
+
+v <- logs %>% 
+  select("iter","train_rmse_mean","test_rmse_mean") %>% 
+  gather("Type","Mean_RSME",-1) 
+
+ggplot(v,aes(iter,Mean_RSME,color = Type))+
+  geom_line()+
+  theme_classic()+
+  ggtitle("Root Mean Square for Train and Test data")+
+  theme(legend.position = "top",legend.justification = "left")+
+  labs(x= "No. of Iteration" , y = "Mean Root Mean Square",color = "")+
+  geom_point(aes(x=iter[344],y=Mean_RSME[344],color = Type[344]),size = 3)
+
+
+
+```
+
+
+From the cross validation plot we see mean rsme on test data comes to `r logs$test_rmse_mean[44]` hence, we consider n-rounds more than 44 to build XGboost Model with tuned parameters. Considering depth = 7, eta(learning rate) = 0.3, nrounds = 50.
+
+```{r, warning=FALSE}
+
+xg_model_norm <- xgboost(data=as.matrix(train.norm),
+                         label=train$loss,nrounds = 50,
+                         objective = "reg:linear",
+                         eta=0.3,
+                         depth=7,
+                         verbose=0)
+```
+
+
+**Performance Metrics:**
+```{r, warning=FALSE}
+
+# Predicting the target varialbe on train data
+
+pxgn_1 <- predict( xg_model_norm, as.matrix(train.norm))
+
+# RMSE of Train data
+
+(xgboost_train_rsme <- sqrt ( mean (( train$loss-pxgn_1 )^2)))
+
+# Rsquared of Train data
+
+(xgboost_train_rsquare<- cor(train$loss, pxgn_1)^2)
+
+# Predicting the target variable on test data
+
+pxgn_2 <- predict( xg_model_norm, as.matrix(test.norm))
+
+# RMSE of Test data
+
+(xgboost_test_norm_rsme <- sqrt(mean((test$loss-pxgn_2)^2)))
+
+# Rsquared of Test data
+
+(xgboost_test_norm_rsquare <- cor(test$loss, pxgn_2)^2)
+
+```
+From the XGboost model we see RSME for *train and test data* are **`r xgboost_train_rsme`** and **`r xgboost_test_norm_rsme`** respectively. The percent of variability of train and test data are **`r xgboost_train_rsquare`** and **`r xgboost_test_norm_rsquare`** respectively. 
+
+```{r echo=FALSE}
+
+d <- data.frame(Model_Test = c("Linear_Base","Linear_Siginificant","Lasso","XGboost"),
+                RSME_Value=c(linear_base_rsme,linear_sig_rsme,lasso_test_rsme,xgboost_test_norm_rsme))
+
+ggplot(d,aes(reorder(Model_Test,RSME_Value,desc),RSME_Value))+
+  geom_line(aes(group=1),color = "blue",size=1.5)+
+  theme_classic()+
+  ggtitle("Comparision of Root Mean Square Error for all model on test data")+
+  labs(x = "Model Used For Evaluation ", y= "Root Mean Square")
+
+```
+
+
+## Conclusion
+
+From all the above observations, we can conclude that lasso regression and XGboost are performing better than simple linear regression. When using ensemble method(XGboost), we observe that it was creating *false assumptions* saying that training data can predict with accuracy of 95% but it *under performs* on new data(test data) with accuracy of 33%. It's clear that the ensemble model is overfitting and not desirable. While, **regularizied regression model(Lasso)** are *consistent* because training and test RMSE are approximately similar. Hence, we choose this model for prediction on test scenario.
+
+
+```{r}
+lasso_lgd <- model_cv
+saveRDS(lasso_lgd, "./lasso_lgd.rds")
+```
+
